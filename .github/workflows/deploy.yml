@@ -3,55 +3,87 @@ name: Deploy AWS
 on:
   push:
     branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      pull-requests: write
-      packages: write
+      contents: read
 
     steps:
-      - name: Clone do projeto
+      - name: Checkout do projeto
         uses: actions/checkout@v4
-        
+
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           java-version: '21'
           distribution: 'temurin'
-          server-id: github # Value of the distributionManagement/repository/id field of the pom.xml
-          settings-path: ${{ github.workspace }} # location for the settings.xml file
-          
-      - name: Build with Maven
-        run: mvn clean install
 
-      - name: Login to Docker Hub
+      - name: Build com Maven (gera o JAR)
+        run: ./mvnw -DskipTests package
+
+      - name: Login no Docker Hub
         uses: docker/login-action@v3
         with:
-          username: "ezambomsantana"
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-          
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-        
-      - name: Build and push
+
+      - name: Build e Push da imagem
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ezambomsantana/pessoas-ci:${{ github.sha }}
+          # publica com a tag do commit e também "latest" (útil para testes manuais)
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/pessoas-ci:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/pessoas-ci:latest
 
-      - name: executing remote ssh commands using password
-        uses: appleboy/ssh-action@master
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy remoto via SSH (EC2)
+        uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.HOST_TEST }}
-          username: "ubuntu"
+          username: ubuntu
           key: ${{ secrets.KEY_TEST }}
-          port: 22
+          script_stop: true
           script: |
-            docker stop pessoas
-            docker rm --force pessoas
-            docker run -d -p 8080:8080 --name pessoas --network=rede ezambomsantana/pessoas-ci:${{ github.sha }}
+            set -e
+
+            # 1) garantir rede "rede"
+            docker network create rede || true
+
+            # 2) garantir MySQL rodando (ajuste se seu container tiver outro nome)
+            docker ps --format '{{.Names}}' | grep -q '^mysql$' || {
+              echo "ERRO: container 'mysql' não está rodando na EC2. Suba o MySQL antes do deploy."
+              exit 1
+            }
+
+            # 3) parar/remover app antiga
+            docker rm -f stocks-app 2>/dev/null || true
+
+            # 4) baixar imagem nova
+            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/pessoas-ci:${{ github.sha }}
+
+            # 5) subir container na rede 'rede' (porta 8081 no host -> 8080 no container)
+            docker run -d \
+              --name stocks-app \
+              --network=rede \
+              -p 8081:8080 \
+              ${{ secrets.DOCKERHUB_USERNAME }}/pessoas-ci:${{ github.sha }}
+
+            # 6) logs iniciais para conferência no Actions
+            sleep 3
+            docker ps
+            echo "----- LOGS stocks-app (últimas 80 linhas) -----"
+            docker logs --tail=80 stocks-app || true
+            echo "✅ Deploy concluído."
+
